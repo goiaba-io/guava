@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WebSocket Audio Streaming</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      button { font-size: 1rem; padding: 0.6rem 1rem; }
+      #status { margin-left: 1rem; font-weight: 600; }
+      #chosen { margin-top: 0.5rem; color: #333; font-weight: 600; }
+      pre { background: #111; color: #0f0; padding: 1rem; height: 260px; overflow: auto; }
+      small { color: #666; }
+      #result { margin-top: 1rem; padding: 1rem; border: 1px solid #ccc; }
+      #result strong { display: inline-block; width: 90px; }
+    </style>
+  </head>
+  <body>
+    <h1>WebSocket Audio Streaming</h1>
+    <p>
+      <button id="toggle">Start</button>
+      <span id="status">idle</span>
+    </p>
+    <div id="chosen">codec: — | mime: —</div>
+    <pre id="log"></pre>
+    <div id="result">
+      <p><strong>Transcript:</strong> <span id="transcript">—</span></p>
+      <p><strong>Duration:</strong> <span id="duration">—</span></p>
+    </div>
+    <p><small>Priority: Opus → AAC → WAV</small></p>
+
+    <script>
+      const WS_URL = "ws://localhost:9000/ws";
+      const CHUNK_MS = 250;
+
+      let ws = null;
+      let mediaRecorder = null;
+      let mediaStream = null;
+      let streamId = null;
+      let isStreaming = false;
+      let chosenMime = null;
+      let chosenCodec = null;
+      let waitCloseTimer = null;
+
+      const $btn = document.getElementById("toggle");
+      const $status = document.getElementById("status");
+      const $chosen = document.getElementById("chosen");
+      const $log = document.getElementById("log");
+      const $transcript = document.getElementById("transcript");
+      const $duration = document.getElementById("duration");
+
+      function log(...args) {
+        const line = args.map(a => { try { return typeof a === "string" ? a : JSON.stringify(a); } catch { return String(a); } }).join(" ");
+        $log.textContent += line + "\n";
+        $log.scrollTop = $log.scrollHeight;
+        console.log(...args);
+      }
+
+      function setStatus(s) { $status.textContent = s; }
+      function setChosen(codec, mime) { $chosen.textContent = `codec: ${codec || "—"} | mime: ${mime || "—"}`; }
+
+      function uuidv4() {
+        if (crypto?.randomUUID) return crypto.randomUUID();
+        return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+          const r = (Math.random() * 16) | 0;
+          const v = c === "x" ? r : (r & 0x3) | 0x8;
+          return v.toString(16);
+        });
+      }
+
+      function pickPreferredMime() {
+        const opus = ["audio/webm;codecs=opus","audio/ogg;codecs=opus","audio/webm"];
+        for (const m of opus) if (MediaRecorder.isTypeSupported(m)) return m;
+        const aac = ["audio/mp4;codecs=mp4a.40.2","audio/aac","audio/mpeg;codecs=mp4a.40.2","audio/mp4"];
+        for (const m of aac) if (MediaRecorder.isTypeSupported(m)) return m;
+        const wav = ["audio/wav","audio/wave","audio/x-wav"];
+        for (const m of wav) if (MediaRecorder.isTypeSupported(m)) return m;
+        return null;
+      }
+
+      function codecFromMime(mime) {
+        if (!mime) return null;
+        const m = mime.toLowerCase();
+        if (m.includes("opus")) return "opus";
+        if (m.includes("mp4a") || m.includes("aac")) return "aac";
+        if (m.includes("wav") || m.includes("wave")) return "wav";
+        return "opus";
+      }
+
+      async function startStreaming() {
+        if (isStreaming) return;
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+          log("❌ getUserMedia error", err);
+          alert("Microphone access denied.");
+          return;
+        }
+
+        chosenMime = pickPreferredMime();
+        if (!chosenMime) {
+          log("❌ No supported MIME type (Opus, AAC, WAV)");
+          alert("Your browser does not support MediaRecorder with Opus, AAC or WAV.");
+          mediaStream.getTracks().forEach(t => t.stop());
+          mediaStream = null;
+          return;
+        }
+        chosenCodec = codecFromMime(chosenMime);
+        setChosen(chosenCodec, chosenMime);
+        log("🎛️ MIME:", chosenMime, "codec:", chosenCodec);
+
+        ws = new WebSocket(WS_URL);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = async () => {
+          log("🟢 WS connected:", WS_URL);
+          streamId = uuidv4();
+          const startMsg = { event: "start", id: streamId, codec: chosenCodec };
+          ws.send(JSON.stringify(startMsg));
+          log("➡️ START", startMsg);
+
+          try {
+            mediaRecorder = new MediaRecorder(mediaStream, { mimeType: chosenMime });
+          } catch (err) {
+            log("❌ MediaRecorder init error", err);
+            ws.close(1000, "init failed");
+            cleanup();
+            return;
+          }
+
+          mediaRecorder.ondataavailable = async (e) => {
+            if (!isStreaming || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (e.data && e.data.size > 0) {
+              try {
+                const buf = await e.data.arrayBuffer();
+                ws.send(buf);
+              } catch (err) {
+                log("❌ error reading chunk", err);
+              }
+            }
+          };
+
+          mediaRecorder.onstart = () => log("⏺️ recording started");
+          mediaRecorder.onstop = () => log("⏹️ recording stopped");
+          mediaRecorder.onerror = (e) => log("❌ MediaRecorder error", e.error || e);
+
+          mediaRecorder.start(CHUNK_MS);
+          isStreaming = true;
+          $btn.textContent = "Stop";
+          setStatus(`streaming (id=${streamId}, codec=${chosenCodec})`);
+        };
+
+        ws.onmessage = (ev) => {
+          log("⬅️ WS message:", ev.data);
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.status === "started") {
+              setStatus(`processing (id=${msg.id || streamId})`);
+            } else if (msg.status === "success") {
+              if (msg.transcript) $transcript.textContent = msg.transcript;
+              if (msg.duration)   $duration.textContent   = msg.duration;
+              setStatus("done");
+              if (waitCloseTimer) { clearTimeout(waitCloseTimer); waitCloseTimer = null; }
+              if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000, "done");
+            } else if (msg.status === "error") {
+              setStatus("error");
+            }
+          } catch (e) {
+            log("parse error:", e, ev.data);
+          }
+        };
+
+        ws.onerror = (err) => log("❌ WS error:", err);
+        ws.onclose = () => { log("🔴 WS closed"); cleanup(); };
+      }
+
+      async function stopStreaming() {
+        if (!isStreaming) return;
+        try {
+          if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const endMsg = { event: "end" };
+            ws.send(JSON.stringify(endMsg));
+            log("➡️ END", endMsg);
+            waitCloseTimer = setTimeout(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000, "timeout");
+            }, 30000);
+          }
+        } catch (err) {
+          log("❌ stop error", err);
+          if (ws) try { ws.close(1000, "stop error"); } catch {}
+        }
+      }
+
+      function cleanup() {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") { try { mediaRecorder.stop(); } catch {} }
+        mediaRecorder = null;
+        if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+        ws = null;
+        isStreaming = false;
+        $btn.textContent = "Start";
+        setStatus("idle");
+        setChosen(null, null);
+      }
+
+      document.getElementById("toggle").addEventListener("click", async () => {
+        if (!isStreaming) {
+          setStatus("connecting...");
+          $btn.disabled = true;
+          try { await startStreaming(); } finally { $btn.disabled = false; }
+        } else {
+          $btn.disabled = true;
+          try { await stopStreaming(); } finally { $btn.disabled = false; }
+        }
+      });
+    </script>
+  </body>
+</html>
